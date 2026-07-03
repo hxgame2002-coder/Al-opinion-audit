@@ -20,6 +20,10 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 if not all([FEISHU_WEBHOOK, JIEKOU_ID, JIEKOU_KEY, DEEPSEEK_API_KEY]):
     raise ValueError("❌ 请在 .env 文件中配置 FEISHU_WEBHOOK, JIEKOU_ID, JIEKOU_KEY, DEEPSEEK_API_KEY")
 
+# ================= DailyHotApi 配置 =================
+DAILYHOT_API_BASE = "http://localhost:6688"
+PLATFORMS = ["zhihu", "bilibili", "douyin", "tieba", "thepaper", "sina-news"]
+
 CONFIG_FILE = "config.json"
 
 def load_config():
@@ -79,6 +83,7 @@ def send_to_feishu(message):
     except Exception as e:
         logging.error(f"❌ 推送异常: {e}")
 
+# ---------- 原有微博接口（备用降级） ----------
 def fetch_hotspots():
     url = "https://cn.apihz.cn/api/xinwen/weibo2.php"
     params = {"id": JIEKOU_ID, "key": JIEKOU_KEY}
@@ -94,6 +99,32 @@ def fetch_hotspots():
         logging.error(f"❌ 抓取失败: {e}")
         return []
 
+# ---------- 获取 DailyHotApi 热点（多平台） ----------
+def fetch_dailyhot_hotspots():
+    all_hotspots = []
+    for platform in PLATFORMS:
+        try:
+            url = f"{DAILYHOT_API_BASE}/{platform}"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get('code') == 200 and data.get('data'):
+                    for item in data['data']:
+                        all_hotspots.append({
+                            'title': item.get('title', ''),
+                            'desc_extr': item.get('desc', '') or item.get('hot', '') or '',
+                            'source': platform
+                        })
+                    logging.info(f"✅ 成功获取 {platform} 平台 {len(data['data'])} 条热点")
+                else:
+                    logging.warning(f"⚠️ {platform} 平台返回数据异常")
+            else:
+                logging.error(f"❌ 请求 {platform} 平台失败，状态码: {resp.status_code}")
+        except Exception as e:
+            logging.error(f"❌ 获取 {platform} 平台热点失败: {e}")
+    return all_hotspots
+
+# ---------- DeepSeek 审核标准生成 ----------
 def call_deepseek(title, desc):
     system_prompt = """你是一个舆情审核标准制定专家。请根据给定事件输出JSON：
 {"pass": "通过标准", "block": "拦截标准", "manual": "人工复核内容"}
@@ -114,10 +145,18 @@ def call_deepseek(title, desc):
         logging.error(f"❌ DeepSeek失败: {e}")
         return ("表达哀悼、祈福、理性追问...", "幸灾乐祸、地域攻击、编造谣言...", "疑似谣言需人工核实")
 
-def is_domestic_event(title, desc):
+# ---------- 判断是否为国外事件 ----------
+def is_foreign_event(title, desc):
+    """判断事件是否发生在国外（不含港澳台、新疆、西藏）"""
+    domestic_places = ["新疆", "西藏", "台湾", "香港", "澳门"]
+    for place in domestic_places:
+        if place in title:
+            return False
+
     prompt = f"""
-请根据以下事件信息，判断该事件是否发生在中国境内（包括中国大陆、香港、澳门、台湾）。
-只回答“是”或“否”，不要输出其他任何内容。
+请根据以下事件信息，判断该事件是否发生在**中国境外（即国外）**。
+注意：港澳台、新疆、西藏均属于中国境内，不算国外。
+请只回答“是”或“否”，不要输出其他内容。
 事件标题：{title}
 事件描述：{desc or '无详细描述'}
 """
@@ -131,9 +170,10 @@ def is_domestic_event(title, desc):
         answer = response.choices[0].message.content.strip()
         return "是" in answer
     except Exception as e:
-        logging.error(f"❌ 国内判断API调用失败: {e}")
-        return True
+        logging.error(f"❌ 国外判断API调用失败: {e}")
+        return False
 
+# ---------- 绿色警报 ----------
 def check_green_alerts(green_dates):
     today = datetime.date.today()
     log = {}
@@ -176,8 +216,9 @@ def check_green_alerts(green_dates):
 
     return messages
 
+# ---------- 主扫描 ----------
 def main():
-    logging.info("开始扫描微博热点...")
+    logging.info("开始扫描全网热点...")
 
     config = load_config()
     red_keywords = config.get("RED_KEYWORDS", [])
@@ -196,19 +237,30 @@ def main():
     expire_time = datetime.datetime.now() - datetime.timedelta(days=3)
     pushed = {k: v for k, v in pushed.items() if datetime.datetime.fromisoformat(v) > expire_time}
 
-    hotspots = fetch_hotspots()
+    # ---------- 从 DailyHotApi 获取多平台热点 ----------
+    hotspots = fetch_dailyhot_hotspots()
+
+    # ---------- 如果 DailyHotApi 无数据，降级使用原有微博接口 ----------
+    if not hotspots:
+        logging.warning("⚠️ DailyHotApi 无数据，降级使用微博接口")
+        hotspots = fetch_hotspots()
+        for item in hotspots:
+            item['source'] = 'weibo'
+
     if not hotspots:
         logging.info("无数据")
         return
 
-    logging.info(f"共 {len(hotspots)} 条热点")
+    logging.info(f"共获取 {len(hotspots)} 条热点")
     red_count = yellow_count = 0
 
     for item in hotspots:
         title = item.get('title', '')
         hot = item.get('desc_extr', '')
+        source = item.get('source', 'unknown')
         red = False
 
+        # ---------- 红色警报 ----------
         for kw in red_keywords:
             if kw in title:
                 event_key = f"red_{title}"
@@ -216,25 +268,39 @@ def main():
                     logging.info(f"⏭️ 重复红色事件，跳过: {title}")
                     break
 
-                if not is_domestic_event(title, hot):
-                    logging.info(f"⏭️ 非国内事件，跳过红色警报: {title}")
-                    break
+                # ---- 判断是否为国外 ----
+                foreign = is_foreign_event(title, hot)
 
-                pass_std, block_std, manual_std = call_deepseek(title, hot)
-                text_msg = f"""🔴 红色警报【舆情动态】
+                if foreign:
+                    # 国外事件：不审核，直接推送
+                    text_msg = f"""🔴 红色警报【境外新闻】
+来源：{source}
 事件：{title}
 详情：热度值 {hot}
+🌍 判定：境外事件，不进行内容审核"""
+                    send_to_feishu(text_msg)
+                    logging.info(f"📡 境外新闻，跳过审核: {title}")
+                else:
+                    # 国内事件：正常审核
+                    pass_std, block_std, manual_std = call_deepseek(title, hot)
+                    text_msg = f"""🔴 红色警报【舆情动态】
+来源：{source}
+事件：{title}
+详情：热度值 {hot}
+🌍 判定：国内事件
 
 🤖 AI审核
 ✅通过：{pass_std}
 ❌拦截：{block_std}
 ⚠️复核：{manual_std}"""
-                send_to_feishu(text_msg)
+                    send_to_feishu(text_msg)
+
                 red_count += 1
                 red = True
                 pushed[event_key] = datetime.datetime.now().isoformat()
                 break
 
+        # ---------- 黄色警报 ----------
         if not red:
             for person in yellow_people:
                 if person in title:
@@ -244,6 +310,7 @@ def main():
                         break
 
                     text_msg = f"""🟡 黄色警报【舆情动态】
+来源：{source}
 事件：{title}
 详情：热度值 {hot}"""
                     send_to_feishu(text_msg)
@@ -261,6 +328,7 @@ def main():
         send_to_feishu(msg)
         logging.info(f"绿色警报已推送: {msg[:30]}...")
 
+# ---------- 定时任务 ----------
 import schedule
 
 if __name__ == "__main__":
