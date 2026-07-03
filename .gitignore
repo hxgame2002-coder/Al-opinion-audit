@@ -1,0 +1,10 @@
+.env
+config.json
+*.log
+__pycache__/
+*.pyc
+pushed_events.json
+green_alert_log.json
+.vscode/
+.idea/
+.DS_Store
